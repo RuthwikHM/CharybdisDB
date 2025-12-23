@@ -2,7 +2,7 @@ use axum::{
     Router, debug_handler,
     extract::{Path, State},
     http::{StatusCode, Uri},
-    routing::{get, put},
+    routing::{delete, get, put},
 };
 
 mod storage;
@@ -37,12 +37,24 @@ async fn get_key(
     }
 }
 
+#[debug_handler]
+async fn delete_key(Path(key): Path<String>, State(mut kv_store): State<KVStore>) -> StatusCode {
+    println!("Delete {:?} called", key);
+    kv_store.delete(key).await;
+    // if value == "" {
+    //     return (StatusCode::NOT_FOUND, "Key doesnt exist".to_string());
+    // } else {
+    return StatusCode::OK;
+    // }
+}
+
 #[tokio::main]
 async fn main() {
     let kv_store = KVStore::new().await;
     let app = Router::new()
         .route("/:key", put(insert_key))
         .route("/:key", get(get_key))
+        .route("/:key", delete(delete_key))
         .fallback(|uri: Uri| async move {
             println!("AXUM FALLBACK HIT: {}", uri);
             StatusCode::NOT_FOUND

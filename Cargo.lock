@@ -3,6 +3,18 @@
 version = 4
 
 [[package]]
+name = "CharybdisDB"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -584,18 +596,6 @@ checksum = "464a3709c7f55f1f721e5389aa6ea4e3bc6aba669353300af094b29ffbdde1d8"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "kvstore"
-version = "0.1.0"
-dependencies = [
- "axum",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
 ]
 
 [[package]]

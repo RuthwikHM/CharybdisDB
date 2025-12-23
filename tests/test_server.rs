@@ -14,6 +14,7 @@ mod tests {
     enum Method {
         GET,
         PUT,
+        DELETE,
         INVALID,
     }
 
@@ -59,47 +60,60 @@ mod tests {
 
     #[tokio::test]
     async fn test_server() {
-        let test_file_path = Path::new("tests/put.txt");
+        let test_file_path = Path::new("tests/put-delete.txt");
         let path = test_file_path.display();
         let file = match File::open(test_file_path) {
             Err(err) => panic!("Unable to open file {}:{}", path, err),
             Ok(file) => file,
         };
-        let pattern = Regex::new(r"(PUT|GET) (.+) (.+)").unwrap();
+        let put_get_pattern = Regex::new(r"(PUT|GET) (.+) (.+)").unwrap();
+        let delete_pattern = Regex::new(r"DELETE (.+)").unwrap();
         let client = Client::new();
         let requests: Vec<Request> = BufReader::new(file)
             .lines()
             .map(|line| {
                 let line_str = line.unwrap_or_default();
-                if let Some(captures) = pattern.captures(&line_str) {
-                    let method = captures
-                        .get(1)
-                        .map(|m| {
-                            if m.as_str() == "GET" {
-                                return Method::GET;
-                            } else {
-                                return Method::PUT;
-                            }
-                        })
-                        .unwrap();
-                    let key = captures.get(2).map(|m| m.as_str()).unwrap().to_string();
-                    let value = captures
-                        .get(3)
-                        .map(|m| {
-                            return match m.as_str() != "NOT_FOUND" {
-                                true => m.as_str(),
-                                false => "",
+                match put_get_pattern.captures(&line_str) {
+                    Some(captures) => {
+                        let method = captures
+                            .get(1)
+                            .map(|m| {
+                                if m.as_str() == "GET" {
+                                    return Method::GET;
+                                } else {
+                                    return Method::PUT;
+                                }
+                            })
+                            .unwrap();
+                        let key = captures.get(2).map(|m| m.as_str()).unwrap().to_string();
+                        let value = captures
+                            .get(3)
+                            .map(|m| {
+                                return match m.as_str() != "NOT_FOUND" {
+                                    true => m.as_str(),
+                                    false => "",
+                                };
+                            })
+                            .unwrap()
+                            .to_string();
+                        return Request { method, key, value };
+                    }
+                    None => match delete_pattern.captures(&line_str) {
+                        Some(captures) => {
+                            return Request {
+                                method: Method::DELETE,
+                                key: captures.get(1).map(|m| m.as_str()).unwrap().to_string(),
+                                value: "".to_string(),
                             };
-                        })
-                        .unwrap()
-                        .to_string();
-                    return Request { method, key, value };
-                } else {
-                    return Request {
-                        method: Method::INVALID,
-                        key: "".to_string(),
-                        value: "".to_string(),
-                    };
+                        }
+                        None => {
+                            return Request {
+                                method: Method::INVALID,
+                                key: "".to_string(),
+                                value: "".to_string(),
+                            };
+                        }
+                    },
                 }
             })
             .collect();
@@ -132,6 +146,16 @@ mod tests {
                         client
                             .put(format!("http://localhost:8000/{}", req.key))
                             .body(req.value.clone())
+                            .send()
+                    })
+                    .await;
+                    assert_eq!(resp.is_ok(), true);
+                    assert_eq!(resp.unwrap().status(), StatusCode::OK);
+                }
+                Method::DELETE => {
+                    let resp = retry(|| {
+                        client
+                            .delete(format!("http://localhost:8000/{}", req.key))
                             .send()
                     })
                     .await;
