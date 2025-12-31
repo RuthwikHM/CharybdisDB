@@ -11,7 +11,7 @@ use crate::storage::KVStore;
 #[debug_handler]
 async fn insert_key(
     Path(key): Path<String>,
-    State(mut kv_store): State<KVStore>,
+    State(kv_store): State<KVStore>,
     body: String,
 ) -> StatusCode {
     println!("Put {:?} {:?} called", key, body);
@@ -24,10 +24,7 @@ async fn insert_key(
 }
 
 #[debug_handler]
-async fn get_key(
-    Path(key): Path<String>,
-    State(mut kv_store): State<KVStore>,
-) -> (StatusCode, String) {
+async fn get_key(Path(key): Path<String>, State(kv_store): State<KVStore>) -> (StatusCode, String) {
     println!("Get {:?} called", key);
     let value = kv_store.get(&key).await;
     if value == "" {
@@ -38,7 +35,7 @@ async fn get_key(
 }
 
 #[debug_handler]
-async fn delete_key(Path(key): Path<String>, State(mut kv_store): State<KVStore>) -> StatusCode {
+async fn delete_key(Path(key): Path<String>, State(kv_store): State<KVStore>) -> StatusCode {
     println!("Delete {:?} called", key);
     kv_store.delete(key).await;
     // if value == "" {

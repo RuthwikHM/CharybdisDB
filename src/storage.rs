@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
 use std::fs::OpenOptions;
+use std::io::{BufReader, BufWriter};
 use std::sync::atomic::AtomicU16;
 use std::{
     collections::HashMap,
@@ -53,7 +54,7 @@ impl KVStore {
         return kvstore;
     }
 
-    pub async fn put(&mut self, key: String, value: String) {
+    pub async fn put(&self, key: String, value: String) {
         let mut store = self.store.write().await;
 
         let wal_entry = WALEntry {
@@ -80,7 +81,7 @@ impl KVStore {
         drop(store);
     }
 
-    pub async fn delete(&mut self, key: String) {
+    pub async fn delete(&self, key: String) {
         let mut store = self.store.write().await;
 
         let wal_entry = WALEntry {
@@ -106,7 +107,7 @@ impl KVStore {
         drop(store);
     }
 
-    pub async fn get(&mut self, key: &String) -> String {
+    pub async fn get(&self, key: &String) -> String {
         let store = self.store.read().await;
         match store.get(key) {
             Some(potential_value) => {
@@ -126,24 +127,45 @@ impl KVStore {
                 let sst_files: Vec<&str> = manifest_content.lines().collect();
                 for sst_file in sst_files.iter().rev() {
                     let sst_file_path = Path::new(DATA_DIR).join(sst_file);
-                    let sst_file_descriptor = match File::open(sst_file_path) {
-                        Ok(file) => file,
-                        Err(err) => panic!("Error reading SST file {}: {}", sst_file, err),
-                    };
-                    let sst_file_contents: Vec<SSTableEntry> =
-                        serde_json::from_reader(sst_file_descriptor).expect(&format!(
-                            "Failed to parse contents of {} into as JSON",
-                            sst_file
-                        ));
-
-                    for entry in sst_file_contents {
-                        if entry.key == comp_key {
-                            if entry.deleted {
-                                // Tombstone i.e. deleted value
-                                return "".to_string();
-                            } else {
-                                return entry.value;
+                    let entries: Vec<SSTableEntry> = SSTIterator::open(sst_file_path.as_path())
+                        .lines
+                        .map(|line| {
+                            let line_str = line.unwrap();
+                            match serde_json::from_str(&line_str) {
+                                Ok(sst_entry) => sst_entry,
+                                Err(err) => panic!("Failed to parse {}: {}", line_str, err),
                             }
+                        })
+                        .collect();
+                    let size: usize = entries.len();
+                    let mut l: usize = 0;
+                    let mut r: usize = size - 1;
+                    let mut mid: usize;
+                    while l <= r {
+                        mid = l + (r - l) / 2;
+                        let entry: &SSTableEntry = &entries[mid];
+                        match &entry.key {
+                            key if *key < comp_key => {
+                                if mid == size - 1 {
+                                    break;
+                                }
+                                l = mid + 1;
+                            }
+                            key if *key > comp_key => {
+                                if mid == 0 {
+                                    break;
+                                }
+                                r = mid - 1;
+                            }
+                            key if *key == comp_key => {
+                                if entry.deleted {
+                                    // Tombstone i.e. deleted value
+                                    return "".to_string();
+                                } else {
+                                    return entry.value.clone();
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -161,24 +183,11 @@ impl KVStore {
             Err(err) => panic!("Error reading MANIFEST file: {}", err),
         };
         let sst_file_paths: Vec<&str> = manifest_content_itr.lines().collect();
-        let sst_content_itrs: Vec<String> = sst_file_paths
+        let mut sst_itrs: Vec<SSTIterator> = sst_file_paths
             .iter()
             .map(|sst_file| {
-                let sst_file_path = Path::new(DATA_DIR).join(sst_file);
-                match fs::read_to_string(sst_file_path) {
-                    Ok(file) => file,
-                    Err(err) => panic!("Error reading SST file {}: {}", sst_file, err),
-                }
+                return SSTIterator::open(Path::new(DATA_DIR).join(sst_file).as_path());
             })
-            .collect();
-        let mut sst_file_entries: Vec<Vec<SSTableEntry>> = sst_content_itrs
-            .iter()
-            .map(|sst_content| serde_json::from_str::<Vec<SSTableEntry>>(sst_content).unwrap())
-            .collect();
-
-        let mut sst_itrs: Vec<std::slice::IterMut<'_, SSTableEntry>> = sst_file_entries
-            .iter_mut()
-            .map(|sst_entries_vec| sst_entries_vec.iter_mut())
             .collect();
 
         for (i, itr) in sst_itrs.iter_mut().enumerate() {
@@ -217,7 +226,7 @@ impl KVStore {
                 });
 
                 if new_sst_table.len() == 2000 {
-                    // Write all to an SST file and update Manifest
+                    // Write all entries to an SST file
                     new_sst_names.push(self.write_sst(&new_sst_table));
                     new_sst_table.clear();
                 }
@@ -293,31 +302,24 @@ impl KVStore {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let sst_file_name = format!("{}-{}.json", SST_FILE_PREFIX, current_sst_id);
         let sst_file_path = Path::new(DATA_DIR).join(&sst_file_name);
-        let json_string = match serde_json::to_string(&ss_table) {
-            Ok(json_string) => json_string,
-            Err(err) => panic!("Couldnt parse to SSTable:{}", err),
-        };
-        let mut sst_file_descriptor = match File::create(sst_file_path) {
+        // let json_string = match serde_json::to_string(&ss_table) {
+        //     Ok(json_string) => json_string,
+        //     Err(err) => panic!("Couldnt parse to SSTable:{}", err),
+        // };
+        let sst_file_descriptor = match File::create(sst_file_path) {
             Ok(file) => file,
             Err(err) => panic!("Unable to open SSTable file {}: {}", sst_file_name, err),
         };
 
-        match sst_file_descriptor.write_all(json_string.as_bytes()) {
-            Ok(_) => {
-                let _ = sst_file_descriptor.sync_all().unwrap();
-                println!("Wrote contents to file {}", sst_file_name);
-                // self.next_sst_id
-                //     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                println!(
-                    "Next sst-ID:{}",
-                    self.next_sst_id.load(std::sync::atomic::Ordering::SeqCst)
-                );
-            }
-            Err(err) => panic!(
-                "Unable to write contents to file {}: {}",
-                sst_file_name, err
-            ),
+        let mut writer = BufWriter::new(sst_file_descriptor);
+
+        for sst_entry in ss_table {
+            serde_json::to_writer(&mut writer, sst_entry).unwrap();
+            writer.write_all(b"\n").unwrap();
         }
+
+        writer.flush().unwrap();
+        writer.get_ref().sync_all().unwrap();
         return sst_file_name;
     }
 
@@ -534,6 +536,30 @@ struct SSTableEntry {
     key: String,
     value: String,
     deleted: bool,
+}
+
+struct SSTIterator {
+    lines: io::Lines<io::BufReader<File>>,
+}
+
+impl SSTIterator {
+    fn open(path: &Path) -> Self {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(err) => panic!("Failed to open file {:?}: {}", path, err),
+        };
+        let reader = BufReader::new(file);
+        return Self {
+            lines: reader.lines(),
+        };
+    }
+
+    fn next(&mut self) -> Option<SSTableEntry> {
+        match self.lines.next() {
+            Some(line) => serde_json::from_str(&line.unwrap()).unwrap(),
+            None => None,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
