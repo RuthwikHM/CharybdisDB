@@ -1,10 +1,9 @@
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{BufReader, BufWriter};
-use std::sync::atomic::AtomicU16;
+use std::sync::atomic::AtomicI16;
 use std::{
-    collections::HashMap,
     fs::{self, File, create_dir},
     io::{self, BufRead, Write},
     path::Path,
@@ -12,7 +11,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{RwLock, RwLockWriteGuard};
+use tokio::sync::RwLock;
 
 const DATA_DIR: &str = "data";
 const MANIFEST: &str = "MANIFEST";
@@ -22,17 +21,21 @@ const WAL: &str = "wal.db";
 
 #[derive(Debug, Clone)]
 pub struct KVStore {
-    store: Arc<RwLock<HashMap<String, Option<String>>>>,
+    store: Arc<RwLock<BTreeMap<String, Option<String>>>>,
     next_sst_id: Arc<AtomicU32>,
-    num_updates: Arc<AtomicU16>,
+    num_updates: Arc<AtomicU32>,
+    manifest: Arc<RwLock<Vec<String>>>,
+    wal_sync_counter: Arc<AtomicI16>,
 }
 
 impl KVStore {
     pub async fn new() -> Self {
         let kvstore = Self {
-            store: Arc::new(RwLock::new(HashMap::new())),
+            store: Arc::new(RwLock::new(BTreeMap::new())),
             next_sst_id: Arc::new(AtomicU32::new(0)),
-            num_updates: Arc::new(AtomicU16::new(0)),
+            num_updates: Arc::new(AtomicU32::new(0)),
+            manifest: Arc::new(RwLock::new(Vec::<String>::new())),
+            wal_sync_counter: Arc::new(AtomicI16::new(0)),
         };
         let data_dir = Path::new(DATA_DIR);
         if !data_dir.exists() {
@@ -41,14 +44,14 @@ impl KVStore {
                     println!("Created data directory:{}", DATA_DIR);
                     kvstore
                         .next_sst_id
-                        .store(1, std::sync::atomic::Ordering::SeqCst);
+                        .store(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 Err(err) => {
                     panic!("Failed to create data directory: {}", err)
                 }
             };
         }
-        manage_manifest(&kvstore, data_dir);
+        manage_manifest(&kvstore, data_dir).await;
 
         replay_wal(&kvstore, data_dir).await;
         return kvstore;
@@ -60,25 +63,24 @@ impl KVStore {
         let wal_entry = WALEntry {
             operation: "put".to_string(),
             key: key.clone(),
-            value: value.clone(),
+            value: Some(value.clone()),
         };
         self.add_wal_entry(wal_entry);
 
         store.insert(key, Some(value));
 
         if store.len() == 2000 {
-            self.write_memtable_to_sst(&mut store);
+            self.write_memtable_to_sst(&mut store).await;
         }
 
         self.num_updates
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if self.num_updates.load(std::sync::atomic::Ordering::SeqCst) == 10000 {
-            self.compact_sst(&store);
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.num_updates.load(std::sync::atomic::Ordering::Relaxed) == 10000 {
+            drop(store);
+            self.compact_sst().await;
             self.num_updates
-                .store(0, std::sync::atomic::Ordering::SeqCst);
+                .store(0, std::sync::atomic::Ordering::Relaxed);
         }
-
-        drop(store);
     }
 
     pub async fn delete(&self, key: String) {
@@ -87,24 +89,24 @@ impl KVStore {
         let wal_entry = WALEntry {
             operation: "delete".to_string(),
             key: key.clone(),
-            value: String::new(),
+            value: None,
         };
         self.add_wal_entry(wal_entry);
 
         store.insert(key, None);
 
         if store.len() == 2000 {
-            self.write_memtable_to_sst(&mut store);
+            self.write_memtable_to_sst(&mut store).await;
         }
 
         self.num_updates
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if self.num_updates.load(std::sync::atomic::Ordering::SeqCst) == 10000 {
-            self.compact_sst(&store);
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.num_updates.load(std::sync::atomic::Ordering::Relaxed) == 10000 {
+            drop(store);
+            self.compact_sst().await;
             self.num_updates
-                .store(0, std::sync::atomic::Ordering::SeqCst);
+                .store(0, std::sync::atomic::Ordering::Relaxed);
         }
-        drop(store);
     }
 
     pub async fn get(&self, key: &String) -> String {
@@ -118,25 +120,18 @@ impl KVStore {
                 };
             }
             None => {
+                drop(store);
                 let comp_key = key.to_string();
-                let manifest_file_path = Path::new(DATA_DIR).join(MANIFEST);
-                let manifest_content = match fs::read_to_string(manifest_file_path) {
-                    Ok(content) => content,
-                    Err(err) => panic!("Error reading MANIFEST file: {}", err),
-                };
-                let sst_files: Vec<&str> = manifest_content.lines().collect();
+                let sst_files = self.manifest.read().await;
+                let mut entries: Vec<SSTableEntry> = Vec::new();
+                entries.reserve(2000);
+
                 for sst_file in sst_files.iter().rev() {
+                    entries.clear();
                     let sst_file_path = Path::new(DATA_DIR).join(sst_file);
-                    let entries: Vec<SSTableEntry> = SSTIterator::open(sst_file_path.as_path())
-                        .lines
-                        .map(|line| {
-                            let line_str = line.unwrap();
-                            match serde_json::from_str(&line_str) {
-                                Ok(sst_entry) => sst_entry,
-                                Err(err) => panic!("Failed to parse {}: {}", line_str, err),
-                            }
-                        })
-                        .collect();
+                    entries.extend(
+                        SSTIterator::open(sst_file_path.as_path()).map(|sst_entry| sst_entry),
+                    );
                     let size: usize = entries.len();
                     let mut l: usize = 0;
                     let mut r: usize = size - 1;
@@ -158,12 +153,13 @@ impl KVStore {
                                 r = mid - 1;
                             }
                             key if *key == comp_key => {
-                                if entry.deleted {
-                                    // Tombstone i.e. deleted value
-                                    return "".to_string();
-                                } else {
-                                    return entry.value.clone();
-                                }
+                                return match &entry.value {
+                                    Some(value) => value.clone(),
+                                    None => {
+                                        // Tombstone i.e. deleted value
+                                        "".to_string()
+                                    }
+                                };
                             }
                             _ => {}
                         }
@@ -174,15 +170,10 @@ impl KVStore {
         }
     }
 
-    fn compact_sst(&self, _: &RwLockWriteGuard<'_, HashMap<String, Option<String>>>) {
+    async fn compact_sst(&self) {
         println!("Compacting SSTs");
         let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
-        let manifest_file_path = Path::new(DATA_DIR).join(MANIFEST);
-        let manifest_content_itr = match fs::read_to_string(manifest_file_path) {
-            Ok(content) => content,
-            Err(err) => panic!("Error reading MANIFEST file: {}", err),
-        };
-        let sst_file_paths: Vec<&str> = manifest_content_itr.lines().collect();
+        let sst_file_paths = self.manifest.read().await.clone();
         let mut sst_itrs: Vec<SSTIterator> = sst_file_paths
             .iter()
             .map(|sst_file| {
@@ -193,10 +184,9 @@ impl KVStore {
         for (i, itr) in sst_itrs.iter_mut().enumerate() {
             if let Some(sst_entry) = itr.next() {
                 let heap_entry = HeapEntry {
-                    key: sst_entry.key.to_string(),
-                    value: sst_entry.value.to_string(),
-                    deleted: sst_entry.deleted,
-                    sst_table_pos: i,
+                    key: sst_entry.key,
+                    value: sst_entry.value,
+                    sst_table_pos: i as u64,
                 };
                 heap.push(heap_entry);
             }
@@ -218,11 +208,10 @@ impl KVStore {
             }
 
             let newest = &drained[0];
-            if !newest.deleted {
+            if !is_deleted(&newest.value) {
                 new_sst_table.push(SSTableEntry {
                     key: newest.key.clone(),
                     value: newest.value.clone(),
-                    deleted: false,
                 });
 
                 if new_sst_table.len() == 2000 {
@@ -233,12 +222,11 @@ impl KVStore {
             }
 
             for entry in drained {
-                let itr = &mut sst_itrs[entry.sst_table_pos];
+                let itr = &mut sst_itrs[entry.sst_table_pos as usize];
                 if let Some(sst_entry) = itr.next() {
                     let heap_entry = HeapEntry {
                         key: sst_entry.key.to_string(),
-                        value: sst_entry.value.to_string(),
-                        deleted: sst_entry.deleted,
+                        value: sst_entry.value,
                         sst_table_pos: entry.sst_table_pos,
                     };
                     heap.push(heap_entry);
@@ -251,6 +239,9 @@ impl KVStore {
             new_sst_table.clear();
         }
 
+        let mut manifest_entries = self.manifest.write().await;
+        *manifest_entries = new_sst_names.clone();
+
         self.update_manifest_atomic(new_sst_names, false);
 
         sst_file_paths.iter().for_each(|sst_file| {
@@ -262,27 +253,24 @@ impl KVStore {
         println!("Compaction complete")
     }
 
-    fn write_memtable_to_sst(
+    async fn write_memtable_to_sst(
         &self,
-        store: &mut tokio::sync::RwLockWriteGuard<'_, HashMap<String, Option<String>>>,
+        store: &mut tokio::sync::RwLockWriteGuard<'_, BTreeMap<String, Option<String>>>,
     ) {
-        let mut keys: Vec<&String> = store.keys().collect();
-        keys.sort();
-        let mut ss_table: Vec<SSTableEntry> = Vec::with_capacity(keys.len());
-        for key in keys {
-            match store.get(key).unwrap() {
+        let mut ss_table: Vec<SSTableEntry> = Vec::new();
+        ss_table.reserve(store.len());
+        for (key, opt_val) in store.iter() {
+            match opt_val {
                 Some(value) => {
                     ss_table.push(SSTableEntry {
                         key: key.to_string(),
-                        value: value.to_string(),
-                        deleted: false,
+                        value: Some(value.to_string()),
                     });
                 }
                 None => {
                     ss_table.push(SSTableEntry {
                         key: key.to_string(),
-                        value: String::new(),
-                        deleted: true,
+                        value: None,
                     });
                 }
             };
@@ -290,7 +278,11 @@ impl KVStore {
 
         let sst_file_names = vec![self.write_sst(&ss_table)];
 
+        let mut manifest_entries = self.manifest.write().await;
+        manifest_entries.extend(sst_file_names.clone());
+
         self.update_manifest_atomic(sst_file_names, true);
+        truncate_wal();
 
         //Clear MemTable
         store.clear();
@@ -299,7 +291,7 @@ impl KVStore {
     fn write_sst(&self, ss_table: &Vec<SSTableEntry>) -> String {
         let current_sst_id = self
             .next_sst_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sst_file_name = format!("{}-{}.json", SST_FILE_PREFIX, current_sst_id);
         let sst_file_path = Path::new(DATA_DIR).join(&sst_file_name);
         // let json_string = match serde_json::to_string(&ss_table) {
@@ -320,6 +312,7 @@ impl KVStore {
 
         writer.flush().unwrap();
         writer.get_ref().sync_all().unwrap();
+        File::open(Path::new(DATA_DIR)).unwrap().sync_all().unwrap();
         return sst_file_name;
     }
 
@@ -332,7 +325,17 @@ impl KVStore {
         let wal_entry_string = serde_json::to_string(&wal_entry).unwrap() + "\n";
         match wal_fd.write_all(wal_entry_string.as_bytes()) {
             Ok(_) => {
-                wal_fd.sync_all().unwrap();
+                self.wal_sync_counter
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if self
+                    .wal_sync_counter
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    == 100
+                {
+                    self.wal_sync_counter
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                    wal_fd.sync_all().unwrap();
+                }
             }
             Err(err) => {
                 panic!("Unable to write WAL entry {}: {}", wal_entry_string, err)
@@ -371,8 +374,6 @@ impl KVStore {
             .unwrap()
             .sync_all()
             .unwrap();
-
-        truncate_wal();
     }
 }
 
@@ -394,13 +395,13 @@ fn truncate_wal() {
     };
 }
 
-fn manage_manifest(kvstore: &KVStore, data_dir: &Path) {
+async fn manage_manifest(kvstore: &KVStore, data_dir: &Path) {
     let manifest_file = data_dir.join(MANIFEST);
     match manifest_file.exists() {
         false => {
             kvstore
                 .next_sst_id
-                .store(1, std::sync::atomic::Ordering::SeqCst);
+                .store(1, std::sync::atomic::Ordering::Relaxed);
             let manifest_file_path = manifest_file.clone();
             match File::create(manifest_file) {
                 Ok(_) => {
@@ -423,11 +424,13 @@ fn manage_manifest(kvstore: &KVStore, data_dir: &Path) {
                     file_path.starts_with(format!("{}/{}", DATA_DIR, SST_FILE_PREFIX).as_str())
                 })
                 .collect();
-            let manifest_entries: Vec<String> = fs::read_to_string(manifest_file)
-                .unwrap()
-                .lines()
-                .map(|entry| entry.to_string())
-                .collect();
+            let mut manifest_entries = kvstore.manifest.write().await;
+            manifest_entries.extend(
+                fs::read_to_string(manifest_file)
+                    .unwrap()
+                    .lines()
+                    .map(|entry| entry.to_string()),
+            );
             manifest_entries.iter().for_each(|sst_file| {
                 sst_files.remove(&data_dir.join(sst_file).display().to_string());
             });
@@ -458,7 +461,7 @@ fn manage_manifest(kvstore: &KVStore, data_dir: &Path) {
 
             kvstore
                 .next_sst_id
-                .store(next_sst_id, std::sync::atomic::Ordering::SeqCst);
+                .store(next_sst_id, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -479,7 +482,7 @@ async fn replay_wal(kvstore: &KVStore, data_dir: &Path) {
                     .expect(&format!("Failed to parse {} as JSON\n", line));
                 match wal_entry.operation.as_str() {
                     "put" => {
-                        store.insert(wal_entry.key, Some(wal_entry.value));
+                        store.insert(wal_entry.key, Some(wal_entry.value.unwrap()));
                     }
                     "delete" => {
                         store.insert(wal_entry.key, None);
@@ -499,12 +502,15 @@ async fn replay_wal(kvstore: &KVStore, data_dir: &Path) {
     };
 }
 
+fn is_deleted(value: &Option<String>) -> bool {
+    return value.is_none();
+}
+
 #[derive(Debug)]
 struct HeapEntry {
     key: String,
-    value: String,
-    deleted: bool,
-    sst_table_pos: usize,
+    value: Option<String>,
+    sst_table_pos: u64,
 }
 
 impl Ord for HeapEntry {
@@ -534,12 +540,12 @@ impl Eq for HeapEntry {}
 #[derive(Serialize, Deserialize, Debug)]
 struct SSTableEntry {
     key: String,
-    value: String,
-    deleted: bool,
+    value: Option<String>,
 }
 
 struct SSTIterator {
-    lines: io::Lines<io::BufReader<File>>,
+    reader: io::BufReader<File>,
+    buf: String,
 }
 
 impl SSTIterator {
@@ -548,17 +554,22 @@ impl SSTIterator {
             Ok(file) => file,
             Err(err) => panic!("Failed to open file {:?}: {}", path, err),
         };
-        let reader = BufReader::new(file);
         return Self {
-            lines: reader.lines(),
+            reader: BufReader::new(file),
+            buf: String::new(),
         };
     }
+}
 
+impl Iterator for SSTIterator {
+    type Item = SSTableEntry;
     fn next(&mut self) -> Option<SSTableEntry> {
-        match self.lines.next() {
-            Some(line) => serde_json::from_str(&line.unwrap()).unwrap(),
-            None => None,
+        self.buf.clear();
+        let bytes = self.reader.read_line(&mut self.buf).ok()?;
+        if bytes == 0 {
+            return None;
         }
+        return serde_json::from_str(&self.buf).ok();
     }
 }
 
@@ -566,5 +577,5 @@ impl SSTIterator {
 struct WALEntry {
     operation: String,
     key: String,
-    value: String,
+    value: Option<String>,
 }
