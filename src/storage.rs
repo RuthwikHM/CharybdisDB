@@ -123,36 +123,13 @@ impl KVStore {
                 drop(store);
                 let comp_key = key.to_string();
                 let sst_files = self.manifest.read().await;
-                let mut entries: Vec<SSTableEntry> = Vec::new();
-                entries.reserve(2000);
 
                 for sst_file in sst_files.iter().rev() {
-                    entries.clear();
                     let sst_file_path = Path::new(DATA_DIR).join(sst_file);
-                    entries.extend(
-                        SSTIterator::open(sst_file_path.as_path()).map(|sst_entry| sst_entry),
-                    );
-                    let size: usize = entries.len();
-                    let mut l: usize = 0;
-                    let mut r: usize = size - 1;
-                    let mut mid: usize;
-                    while l <= r {
-                        mid = l + (r - l) / 2;
-                        let entry: &SSTableEntry = &entries[mid];
-                        match &entry.key {
-                            key if *key < comp_key => {
-                                if mid == size - 1 {
-                                    break;
-                                }
-                                l = mid + 1;
-                            }
-                            key if *key > comp_key => {
-                                if mid == 0 {
-                                    break;
-                                }
-                                r = mid - 1;
-                            }
-                            key if *key == comp_key => {
+                    for entry in SSTIterator::open(&sst_file_path) {
+                        match entry.key.cmp(&comp_key) {
+                            Ordering::Less => continue,
+                            Ordering::Equal => {
                                 return match &entry.value {
                                     Some(value) => value.clone(),
                                     None => {
@@ -161,7 +138,7 @@ impl KVStore {
                                     }
                                 };
                             }
-                            _ => {}
+                            Ordering::Greater => break,
                         }
                     }
                 }
