@@ -38,11 +38,7 @@ async fn get_key(Path(key): Path<String>, State(kv_store): State<KVStore>) -> (S
 async fn delete_key(Path(key): Path<String>, State(kv_store): State<KVStore>) -> StatusCode {
     println!("Delete {:?} called", key);
     kv_store.delete(key).await;
-    // if value == "" {
-    //     return (StatusCode::NOT_FOUND, "Key doesnt exist".to_string());
-    // } else {
     return StatusCode::OK;
-    // }
 }
 
 #[tokio::main]
