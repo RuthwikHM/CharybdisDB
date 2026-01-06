@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::fs::OpenOptions;
-use std::io::{BufReader, BufWriter};
-use std::sync::atomic::AtomicI16;
+use std::io::{BufReader, BufWriter, Seek};
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU8;
 use std::{
     fs::{self, File, create_dir},
     io::{self, BufRead, Write},
@@ -25,17 +26,35 @@ pub struct KVStore {
     next_sst_id: Arc<AtomicU32>,
     num_updates: Arc<AtomicU32>,
     manifest: Arc<RwLock<Vec<String>>>,
-    wal_sync_counter: Arc<AtomicI16>,
+    wal_fd: Arc<Mutex<File>>,
+    wal_write_counter: Arc<AtomicU8>,
 }
 
 impl KVStore {
     pub async fn new() -> Self {
+        let data_dir = Path::new(DATA_DIR);
+        if !data_dir.exists() {
+            create_dir(data_dir).unwrap();
+        }
+
+        let wal_fd = match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(data_dir.join(WAL))
+        {
+            Ok(wal_fd) => wal_fd,
+            Err(err) => {
+                panic!("Unable to open WAL : {}", err)
+            }
+        };
         let kvstore = Self {
             store: Arc::new(RwLock::new(BTreeMap::new())),
             next_sst_id: Arc::new(AtomicU32::new(0)),
             num_updates: Arc::new(AtomicU32::new(0)),
             manifest: Arc::new(RwLock::new(Vec::<String>::new())),
-            wal_sync_counter: Arc::new(AtomicI16::new(0)),
+            wal_fd: Arc::new(Mutex::new(wal_fd)),
+            wal_write_counter: Arc::new(AtomicU8::new(0)),
         };
         let data_dir = Path::new(DATA_DIR);
         if !data_dir.exists() {
@@ -53,20 +72,19 @@ impl KVStore {
         }
         manage_manifest(&kvstore, data_dir).await;
 
-        replay_wal(&kvstore, data_dir).await;
+        replay_wal(&kvstore).await;
         return kvstore;
     }
 
     pub async fn put(&self, key: String, value: String) {
-        let mut store = self.store.write().await;
-
         let wal_entry = WALEntry {
-            operation: "put".to_string(),
+            operation: WALOp::PUT,
             key: key.clone(),
             value: Some(value.clone()),
         };
         self.add_wal_entry(wal_entry);
 
+        let mut store = self.store.write().await;
         store.insert(key, Some(value));
 
         if store.len() == 2000 {
@@ -84,15 +102,14 @@ impl KVStore {
     }
 
     pub async fn delete(&self, key: String) {
-        let mut store = self.store.write().await;
-
         let wal_entry = WALEntry {
-            operation: "delete".to_string(),
+            operation: WALOp::DELETE,
             key: key.clone(),
             value: None,
         };
         self.add_wal_entry(wal_entry);
 
+        let mut store = self.store.write().await;
         store.insert(key, None);
 
         if store.len() == 2000 {
@@ -259,10 +276,12 @@ impl KVStore {
         manifest_entries.extend(sst_file_names.clone());
 
         self.update_manifest_atomic(sst_file_names, true);
-        truncate_wal();
 
         //Clear MemTable
         store.clear();
+
+        // Truncate WAL after SSTs are persisted and Manifest is updated
+        self.truncate_wal();
     }
 
     fn write_sst(&self, ss_table: &Vec<SSTableEntry>) -> String {
@@ -294,24 +313,15 @@ impl KVStore {
     }
 
     fn add_wal_entry(&self, wal_entry: WALEntry) {
-        let mut wal_fd = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(Path::new(DATA_DIR).join(WAL))
-            .unwrap();
+        let mut wal_fd = self.wal_fd.lock().unwrap();
         let wal_entry_string = serde_json::to_string(&wal_entry).unwrap() + "\n";
         match wal_fd.write_all(wal_entry_string.as_bytes()) {
             Ok(_) => {
-                self.wal_sync_counter
+                let old_val = self
+                    .wal_write_counter
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if self
-                    .wal_sync_counter
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    == 100
-                {
-                    self.wal_sync_counter
-                        .store(0, std::sync::atomic::Ordering::Relaxed);
-                    wal_fd.sync_all().unwrap();
+                if old_val % 100 == 99 {
+                    wal_fd.sync_data().unwrap();
                 }
             }
             Err(err) => {
@@ -352,24 +362,12 @@ impl KVStore {
             .sync_all()
             .unwrap();
     }
-}
 
-fn truncate_wal() {
-    let wal_file_path = Path::new(DATA_DIR).join(WAL);
-    match OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(&wal_file_path)
-    {
-        Ok(wal_fd) => {
-            let _ = wal_fd.sync_all();
-        }
-        Err(err) => panic!(
-            "Unable to truncate WAL file {}: {}",
-            wal_file_path.display(),
-            err,
-        ),
-    };
+    fn truncate_wal(&self) {
+        let wal_fd = self.wal_fd.lock().unwrap();
+        wal_fd.set_len(0).unwrap();
+        wal_fd.sync_all().unwrap();
+    }
 }
 
 async fn manage_manifest(kvstore: &KVStore, data_dir: &Path) {
@@ -443,40 +441,31 @@ async fn manage_manifest(kvstore: &KVStore, data_dir: &Path) {
     }
 }
 
-async fn replay_wal(kvstore: &KVStore, data_dir: &Path) {
-    let wal_file = data_dir.join(WAL);
-    match wal_file.exists() {
-        true => {
-            let mut store = kvstore.store.write().await;
-            let wal_fd = match File::open(&wal_file) {
-                Ok(fd) => fd,
-                Err(err) => panic!("Unable to open WAL file {}: {}", wal_file.display(), err),
-            };
-            let reader = io::BufReader::new(wal_fd);
-            reader.lines().for_each(|line| {
-                let line: String = line.unwrap().trim_end().to_string();
-                let wal_entry: WALEntry = serde_json::from_str(&line)
-                    .expect(&format!("Failed to parse {} as JSON\n", line));
-                match wal_entry.operation.as_str() {
-                    "put" => {
-                        store.insert(wal_entry.key, Some(wal_entry.value.unwrap()));
-                    }
-                    "delete" => {
-                        store.insert(wal_entry.key, None);
-                    }
-                    _ => {}
-                }
-            });
+async fn replay_wal(kvstore: &KVStore) {
+    let mut entries: Vec<WALEntry> = Vec::new();
+    let mut wal_fd = kvstore.wal_fd.lock().unwrap();
+    wal_fd.seek(io::SeekFrom::Start(0)).unwrap();
+    let reader = BufReader::new(&*wal_fd);
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+
+        match serde_json::from_str(&line) {
+            Ok(wal_entry) => entries.push(wal_entry),
+            Err(_) => break,
         }
-        false => match File::create(&wal_file) {
-            Ok(_) => {
-                println!("Created WAL file:{}", wal_file.display());
-            }
-            Err(err) => {
-                panic!("Failed to create WAL file {}: {}", wal_file.display(), err);
-            }
-        },
-    };
+    }
+
+    let mut store = kvstore.store.write().await;
+    for wal_entry in entries {
+        store.insert(wal_entry.key, wal_entry.value);
+    }
+
+    // Truncate WAL after replaying
+    wal_fd.set_len(0).unwrap();
+    wal_fd.sync_all().unwrap();
 }
 
 fn is_deleted(value: &Option<String>) -> bool {
@@ -551,8 +540,14 @@ impl Iterator for SSTIterator {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+enum WALOp {
+    PUT,
+    DELETE,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 struct WALEntry {
-    operation: String,
+    operation: WALOp,
     key: String,
     value: Option<String>,
 }
