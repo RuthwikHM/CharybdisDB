@@ -1,7 +1,12 @@
+use crate::bloom_filter::{BLOOM_FILTER_SUFFIX, BLOOM_FP_RATE, BloomFilter};
+use crate::utils::{
+    DATA_DIR, HeapEntry, MANIFEST, MANIFEST_TMP, SPARSE_INDEX_SUFFIX, SST_FILE_PREFIX, SSTIterator,
+    SSTMetadata, SSTableEntry, SparseIndex, SparseIndexEntry, WAL, WALEntry, WALOp, is_deleted,
+    remove_file_extension,
+};
+use rkyv::from_bytes;
 use rkyv::rancor::Error;
 use rkyv::util::AlignedVec;
-use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize, from_bytes};
-use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::fs::OpenOptions;
@@ -16,12 +21,6 @@ use std::{
 };
 use tokio::sync::RwLock;
 
-const DATA_DIR: &str = "data";
-const MANIFEST: &str = "MANIFEST";
-const MANIFEST_TMP: &str = "MANIFEST.tmp";
-const SST_FILE_PREFIX: &str = "sst";
-const SPARSE_INDEX_SUFFIX: &str = "idx";
-const WAL: &str = "wal.db";
 const MEMTABLE_LIMIT: usize = 2000;
 const COMPACTION_TRIGGER: u32 = 10000;
 const WAL_FSYNC_EVERY: u8 = 100;
@@ -151,6 +150,10 @@ impl KVStore {
                 let sst_files_metadata = self.manifest.read().await;
 
                 for sst_file_meta in sst_files_metadata.iter().rev() {
+                    if !sst_file_meta.bloom_filter.might_contain(comp_key) {
+                        continue;
+                    }
+
                     let sst_file_path = Path::new(DATA_DIR).join(&sst_file_meta.file_name);
 
                     let offset = find_sparse_idx_offset(comp_key, sst_file_meta);
@@ -276,6 +279,15 @@ impl KVStore {
                 Ok(_) => println!("Removed old sst index file {}", &sst_idx_name),
                 Err(err) => panic!("Unable to remove old sst index file {}: {}", sst_file, err),
             };
+            let sst_bloom_name = format!(
+                "{}.{}",
+                remove_file_extension(&sst_file),
+                BLOOM_FILTER_SUFFIX
+            );
+            match fs::remove_file(Path::new(DATA_DIR).join(&sst_bloom_name)) {
+                Ok(_) => println!("Removed old sst index file {}", &sst_bloom_name),
+                Err(err) => panic!("Unable to remove old sst index file {}: {}", sst_file, err),
+            };
         });
         println!("Compaction complete")
     }
@@ -335,12 +347,15 @@ impl KVStore {
         };
 
         let mut index = SparseIndex { entries: vec![] };
+        let mut bloom_filter = BloomFilter::new(ss_table.len(), BLOOM_FP_RATE);
         let mut entry_count = 0;
         let mut offset: u64 = 0;
 
         let mut writer = BufWriter::new(sst_file_descriptor);
 
         for sst_entry in ss_table {
+            bloom_filter.insert(&sst_entry.key);
+
             if entry_count % 64 == 0 {
                 index.entries.push(SparseIndexEntry {
                     key: sst_entry.key.to_string(),
@@ -368,14 +383,27 @@ impl KVStore {
         let idx_path = Path::new(DATA_DIR).join(idx_file_name);
         let mut idx_fd = File::create(idx_path).unwrap();
 
-        let bytes = rkyv::to_bytes::<Error>(&index).unwrap();
-        idx_fd.write_all(&bytes).unwrap();
+        let idx_bytes = rkyv::to_bytes::<Error>(&index).unwrap();
+        idx_fd.write_all(&idx_bytes).unwrap();
         idx_fd.sync_all().unwrap();
+
+        // Persist bloom filter
+        let bloom_file_name = format!(
+            "{}-{}.{}",
+            SST_FILE_PREFIX, current_sst_id, BLOOM_FILTER_SUFFIX
+        );
+        let bloom_path = Path::new(DATA_DIR).join(bloom_file_name);
+        let mut bloom_fd = File::create(bloom_path).unwrap();
+
+        let bloom_bytes = rkyv::to_bytes::<Error>(&bloom_filter).unwrap();
+        bloom_fd.write_all(&bloom_bytes).unwrap();
+        bloom_fd.sync_all().unwrap();
 
         File::open(Path::new(DATA_DIR)).unwrap().sync_all().unwrap();
         let sst_file_metadata = SSTMetadata {
             file_name: sst_file_name,
             index,
+            bloom_filter,
         };
         return sst_file_metadata;
     }
@@ -389,7 +417,7 @@ impl KVStore {
                     .wal_write_counter
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if old_val + 1 == WAL_FSYNC_EVERY {
-                    wal_fd.sync_data().unwrap();
+                    wal_fd.sync_all().unwrap();
                     self.wal_write_counter
                         .store(0, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -446,7 +474,11 @@ impl KVStore {
                     continue;
                 }
             };
-            store.insert(wal_entry.key, wal_entry.value);
+
+            match wal_entry.operation {
+                WALOp::PUT => store.insert(wal_entry.key, wal_entry.value),
+                WALOp::DELETE => store.insert(wal_entry.key, None),
+            };
         }
 
         // Truncate WAL after replaying
@@ -482,6 +514,7 @@ impl KVStore {
                         file_path.starts_with(format!("{}/{}", DATA_DIR, SST_FILE_PREFIX).as_str())
                     })
                     .collect();
+
                 let mut manifest_entries = self.manifest.write().await;
                 manifest_entries.extend(fs::read_to_string(manifest_file).unwrap().lines().map(
                     |entry| {
@@ -493,15 +526,28 @@ impl KVStore {
                         index_content_bytes
                             .extend_from_reader(&mut index_fd)
                             .unwrap();
-
                         let index = from_bytes::<SparseIndex, Error>(&index_content_bytes).unwrap();
+
+                        let bloom_filter_file_name =
+                            format!("{}.{}", sst_file, BLOOM_FILTER_SUFFIX);
+                        let mut bloom_fd =
+                            File::open(Path::new(DATA_DIR).join(bloom_filter_file_name)).unwrap();
+                        let mut bloom_content_bytes: AlignedVec<16> = AlignedVec::new();
+                        bloom_content_bytes
+                            .extend_from_reader(&mut bloom_fd)
+                            .unwrap();
+                        let bloom_filter =
+                            from_bytes::<BloomFilter, Error>(&bloom_content_bytes).unwrap();
+
                         let sst_metadata = SSTMetadata {
                             file_name: entry.to_string(),
                             index: index,
+                            bloom_filter: bloom_filter,
                         };
                         return sst_metadata;
                     },
                 ));
+
                 manifest_entries.iter().for_each(|sst_file_meta| {
                     sst_files.remove(
                         &data_dir
@@ -561,115 +607,4 @@ fn find_sparse_idx_offset(comp_key: &str, sst_file_meta: &SSTMetadata) -> u64 {
     } else {
         return entries[l - 1].file_offset;
     }
-}
-
-fn is_deleted(value: &Option<String>) -> bool {
-    return value.is_none();
-}
-
-fn remove_file_extension(file_name: &str) -> &str {
-    let dot_idx = file_name.find(".").unwrap();
-    return &file_name[0..dot_idx];
-}
-
-#[derive(Debug)]
-struct HeapEntry {
-    key: String,
-    value: Option<String>,
-    sst_table_pos: u64,
-}
-
-impl Ord for HeapEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        if self.key != other.key {
-            other.key.cmp(&self.key)
-        } else {
-            self.sst_table_pos.cmp(&other.sst_table_pos)
-        }
-    }
-}
-
-impl PartialOrd for HeapEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for HeapEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key && self.sst_table_pos == other.sst_table_pos
-    }
-}
-
-impl Eq for HeapEntry {}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct SSTableEntry {
-    key: String,
-    value: Option<String>,
-}
-
-struct SSTIterator {
-    reader: io::BufReader<File>,
-    buf: String,
-}
-
-impl SSTIterator {
-    fn open(path: &Path) -> Self {
-        return Self::open_at(path, 0);
-    }
-
-    fn open_at(path: &Path, offset: u64) -> Self {
-        let mut file = match File::open(path) {
-            Ok(file) => file,
-            Err(err) => panic!("Failed to open file {:?}: {}", path, err),
-        };
-        file.seek(io::SeekFrom::Start(offset)).unwrap();
-        return Self {
-            reader: BufReader::new(file),
-            buf: String::new(),
-        };
-    }
-}
-
-impl Iterator for SSTIterator {
-    type Item = SSTableEntry;
-    fn next(&mut self) -> Option<SSTableEntry> {
-        self.buf.clear();
-        let bytes = self.reader.read_line(&mut self.buf).ok()?;
-        if bytes == 0 {
-            return None;
-        }
-        return serde_json::from_str(&self.buf).ok();
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-enum WALOp {
-    PUT,
-    DELETE,
-}
-
-#[derive(Debug)]
-struct SSTMetadata {
-    file_name: String,
-    index: SparseIndex,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct WALEntry {
-    operation: WALOp,
-    key: String,
-    value: Option<String>,
-}
-
-#[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug)]
-struct SparseIndexEntry {
-    pub key: String,
-    pub file_offset: u64,
-}
-
-#[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug)]
-struct SparseIndex {
-    pub entries: Vec<SparseIndexEntry>,
 }
