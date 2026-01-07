@@ -289,6 +289,7 @@ impl KVStore {
                 Err(err) => panic!("Unable to remove old sst index file {}: {}", sst_file, err),
             };
         });
+        File::open(Path::new(DATA_DIR)).unwrap().sync_all().unwrap();
         println!("Compaction complete")
     }
 
@@ -337,10 +338,6 @@ impl KVStore {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sst_file_name = format!("{}-{}.json", SST_FILE_PREFIX, current_sst_id);
         let sst_file_path = Path::new(DATA_DIR).join(&sst_file_name);
-        // let json_string = match serde_json::to_string(&ss_table) {
-        //     Ok(json_string) => json_string,
-        //     Err(err) => panic!("Couldnt parse to SSTable:{}", err),
-        // };
         let sst_file_descriptor = match File::create(sst_file_path) {
             Ok(file) => file,
             Err(err) => panic!("Unable to open SSTable file {}: {}", sst_file_name, err),
