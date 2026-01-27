@@ -38,8 +38,17 @@ pub struct KVStore {
 impl KVStore {
     pub async fn new() -> Self {
         let data_dir = Path::new(DATA_DIR);
+        let mut created_root_dir = false;
         if !data_dir.exists() {
-            create_dir(data_dir).unwrap();
+            match create_dir(data_dir) {
+                Ok(_) => {
+                    println!("Created data directory:{}", DATA_DIR);
+                    created_root_dir = true
+                }
+                Err(err) => {
+                    panic!("Failed to create data directory: {}", err)
+                }
+            };
         }
 
         let wal_fd = match OpenOptions::new()
@@ -62,19 +71,10 @@ impl KVStore {
             wal_fd: Arc::new(Mutex::new(wal_fd)),
             wal_write_counter: Arc::new(AtomicU8::new(0)),
         };
-        let data_dir = Path::new(DATA_DIR);
-        if !data_dir.exists() {
-            match create_dir(data_dir) {
-                Ok(_) => {
-                    println!("Created data directory:{}", DATA_DIR);
-                    kvstore
-                        .next_sst_id
-                        .store(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                Err(err) => {
-                    panic!("Failed to create data directory: {}", err)
-                }
-            };
+        if created_root_dir {
+            kvstore
+                .next_sst_id
+                .store(1, std::sync::atomic::Ordering::Relaxed);
         }
         kvstore.manage_manifest(data_dir).await;
 
