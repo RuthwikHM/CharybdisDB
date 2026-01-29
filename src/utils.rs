@@ -13,6 +13,9 @@ pub const MANIFEST_TMP: &str = "MANIFEST.tmp";
 pub const SST_FILE_PREFIX: &str = "sst";
 pub const SPARSE_INDEX_SUFFIX: &str = "idx";
 pub const WAL: &str = "wal.db";
+pub const LEVEL_PREFIX: &str = "l";
+pub const NUM_LEVELS: u32 = 2;
+pub const L0: &str = "l0";
 
 pub fn is_deleted(value: &Option<String>) -> bool {
     return value.is_none();
@@ -28,14 +31,26 @@ pub struct HeapEntry {
     pub key: String,
     pub value: Option<String>,
     pub sst_table_pos: u64,
+    pub level: u32,
 }
 
 impl Ord for HeapEntry {
+    // Level ordering is L0 at the top followed by other levels moving downward
     fn cmp(&self, other: &Self) -> Ordering {
+        // Sort by keys first
         if self.key != other.key {
             other.key.cmp(&self.key)
         } else {
-            self.sst_table_pos.cmp(&other.sst_table_pos)
+            /* Then prefer higher levels over lower ones
+             * If levels are L0 then order by newest SST entry
+             */
+            if self.level != other.level {
+                self.level.cmp(&other.level)
+            } else if self.level == other.level && self.level == 0 {
+                self.sst_table_pos.cmp(&other.sst_table_pos)
+            } else {
+                Ordering::Equal
+            }
         }
     }
 }
@@ -48,7 +63,9 @@ impl PartialOrd for HeapEntry {
 
 impl PartialEq for HeapEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key && self.sst_table_pos == other.sst_table_pos
+        self.key == other.key
+            && self.sst_table_pos == other.sst_table_pos
+            && self.level == other.level
     }
 }
 
@@ -104,8 +121,10 @@ pub enum WALOp {
 #[derive(Debug)]
 pub struct SSTMetadata {
     pub file_name: String,
-    pub index: SparseIndex,
-    pub bloom_filter: BloomFilter,
+    pub index: Option<SparseIndex>,
+    pub bloom_filter: Option<BloomFilter>,
+    pub min_key: Option<String>,
+    pub max_key: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
