@@ -88,6 +88,7 @@ This design bounds disk I/O while preserving correctness.
 - Atomic counters track SST IDs and update counts
 - WAL file access is serialized via a `Mutex`
 - Designed for correctness over maximal throughput
+- A dedicated background compaction thread
 
 ## Persistence and Crash Consistency
 
@@ -128,7 +129,6 @@ While limited in number, these tests cover the full storage pipeline from client
 ## Limitations
 
 - No range queries or iterators
-- No background compaction thread
 - No checksums or corruption detection
 - JSON based SST format
 - Single node, non distributed design
