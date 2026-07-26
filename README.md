@@ -67,6 +67,7 @@ The system follows a **write-optimized storage model**:
 - Resolves duplicate keys by keeping the newest value
 - Drops deleted keys (tombstones) where safe
 - Produces a new set of compacted SSTs and updates the manifest atomically
+- Also trigger compaction for subsequent levels if needed
 
 ## Read Path
 
@@ -80,6 +81,12 @@ For a `GET(key)` operation:
 3. Return value, tombstone or not found result
 
 This design bounds disk I/O while preserving correctness.
+
+For a `SCAN(start,end)` operation:
+1. Check memtable for valid keys(not deleted)
+2. Check L0 for keys that are valid by using the sparse index for only reading as many entries as needed from a file
+3. Check L1 and lower levels based on the min and max associated with each SST
+4. Return the combined results from all these stages
 
 ## Concurrency Model
 
@@ -120,7 +127,7 @@ The mixed approach favors debuggability for core data and efficiency for metadat
 
 The project currently includes:
 - An end to end integration test (`test_server.rs`)
-  - Validates PUT / GET / DELETE behavior
+  - Validates PUT / GET / DELETE / SCAN behavior
   - Exercises durability via server restarts
   - Verifies correctness across multiple operations
 
@@ -128,7 +135,6 @@ While limited in number, these tests cover the full storage pipeline from client
 
 ## Limitations
 
-- No range queries or iterators
 - No checksums or corruption detection
 - JSON based SST format
 - Single node, non distributed design
@@ -143,7 +149,7 @@ LSM-tree–based storage engines:
 - Atomic metadata management using manifest files
 - Deterministic compaction semantics
 
-Certain production oriented features (e.g., background compaction threads,
+Certain production oriented features (e.g.
 checksumming, compression and binary SST formats) are intentionally omitted
 to keep the implementation compact and auditable and to focus on
 correctness and crash safety over raw throughput.
