@@ -15,7 +15,7 @@ pub const SST_FILE_PREFIX: &str = "sst";
 pub const SPARSE_INDEX_SUFFIX: &str = "idx";
 pub const WAL: &str = "wal.db";
 pub const LEVEL_PREFIX: &str = "l";
-pub const NUM_LEVELS: u32 = 2;
+pub const NUM_LEVELS: u32 = 3;
 pub const L0: &str = "l0";
 
 pub fn is_deleted(value: &Option<String>) -> bool {
@@ -46,7 +46,7 @@ impl Ord for HeapEntry {
              * If levels are L0 then order by newest SST entry
              */
             if self.level != other.level {
-                self.level.cmp(&other.level)
+                other.level.cmp(&self.level)
             } else if self.level == other.level && self.level == 0 {
                 self.sst_table_pos.cmp(&other.sst_table_pos)
             } else {
@@ -156,6 +156,16 @@ pub struct SparseIndex {
 pub struct Range {
     pub start: String,
     pub end: String,
+}
+
+impl Range {
+    pub fn key_in_range(&self, key: String) -> bool {
+        return self.start <= key && key < self.end;
+    }
+
+    pub fn overlap(&self, min: String, max: String) -> bool {
+        return self.start <= max && min < self.end;
+    }
 }
 
 #[derive(Debug)]

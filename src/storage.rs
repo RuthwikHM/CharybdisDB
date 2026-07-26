@@ -9,7 +9,7 @@ use rkyv::from_bytes;
 use rkyv::rancor::Error;
 use rkyv::util::AlignedVec;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{BufReader, BufWriter, Seek};
 use std::str::FromStr;
@@ -83,6 +83,9 @@ impl KVStore {
             while let Some(job) = compaction_rx.recv().await {
                 match job {
                     CompactionJob::CompactLevel(level) => {
+                        if level + 1 >= NUM_LEVELS {
+                            return;
+                        }
                         let level_idx = level as usize;
                         let mut current_size: u32 = 0;
                         {
@@ -136,6 +139,7 @@ impl KVStore {
 
     pub async fn get(&self, key: &str) -> String {
         let store = self.store.read().await;
+        let flag = key == "kgpow";
         match store.get(key) {
             Some(potential_value) => {
                 match potential_value {
@@ -249,14 +253,82 @@ impl KVStore {
         }
     }
 
-    pub async fn scan(&self, _range: Range) -> Vec<String> {
-        let result: Vec<String> = Vec::new();
-        return result;
+    pub async fn scan(&self, range: Range) -> Vec<String> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut result: BTreeSet<String> = BTreeSet::new();
+        // Check memtable
+        {
+            let store = self.store.read().await;
+            for (key, value) in store.iter() {
+                if range.key_in_range(key.to_string()) {
+                    seen.insert(key.to_string());
+                    if value.is_some() {
+                        result.insert(key.to_string());
+                    }
+                }
+            }
+            drop(store);
+        }
+
+        // Checking L0
+        {
+            let l0_guard = self.manifest[0].entries.read().await;
+            for sst_metadata in l0_guard.iter().rev() {
+                let offset = find_sparse_idx_offset(&range.start, sst_metadata);
+                let filtered = SSTIterator::open_at(
+                    Path::new(DATA_DIR)
+                        .join(L0)
+                        .join(&sst_metadata.file_name)
+                        .as_path(),
+                    offset,
+                )
+                .filter(|entry| range.key_in_range(entry.key.clone()));
+                for entry in filtered {
+                    if seen.contains(&entry.key) {
+                        continue;
+                    }
+                    seen.insert(entry.key.clone());
+                    if entry.value.is_some() {
+                        result.insert(entry.key);
+                    }
+                }
+            }
+        }
+
+        for level in 1..NUM_LEVELS {
+            let level_idx: usize = level.try_into().unwrap();
+            let level_guard = self.manifest[level_idx].entries.read().await;
+            for sst_metadata in level_guard.iter() {
+                let min_key = sst_metadata.min_key.clone().unwrap();
+                let max_key = sst_metadata.max_key.clone().unwrap();
+                if !range.overlap(min_key, max_key) {
+                    continue;
+                }
+
+                let filtered = SSTIterator::open(
+                    Path::new(DATA_DIR)
+                        .join(format!("{}{}", LEVEL_PREFIX, level))
+                        .join(&sst_metadata.file_name)
+                        .as_path(),
+                )
+                .filter(|entry| range.key_in_range(entry.key.clone()));
+                for entry in filtered {
+                    if seen.contains(&entry.key) {
+                        continue;
+                    }
+                    seen.insert(entry.key.clone());
+                    if entry.value.is_some() {
+                        result.insert(entry.key);
+                    }
+                }
+            }
+        }
+
+        return Vec::from_iter(result);
     }
 
-    // FIXME compaction logic is breaking now possibly due to me messing with the RWGuards.
     async fn compact_sst(&self, start_level: u32) {
-        println!("Compacting SSTs");
+        println!("Compacting SSTs at level {}", start_level);
         let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
 
         let mut old_sst_file_paths: Vec<Vec<String>> = Vec::new();
@@ -324,6 +396,7 @@ impl KVStore {
 
         while let Some(top) = heap.pop() {
             let key = top.key.clone();
+
             let mut drained = vec![top];
 
             while let Some(head) = heap.peek() {
@@ -335,7 +408,8 @@ impl KVStore {
             }
 
             let newest = &drained[0];
-            if !is_deleted(&newest.value) {
+            // Cannot delete tombstones unless compaction is to the last level
+            if start_level + 1 != NUM_LEVELS - 1 || !is_deleted(&newest.value) {
                 new_sst_table.push(SSTableEntry {
                     key: newest.key.clone(),
                     value: newest.value.clone(),
@@ -349,9 +423,9 @@ impl KVStore {
             }
 
             for entry in drained {
-                let level: usize = entry.level.try_into().unwrap();
+                let relative_level: usize = (entry.level - start_level) as usize;
                 let idx: usize = entry.sst_table_pos.try_into().unwrap();
-                let itr = &mut sst_itrs[level][idx];
+                let itr = &mut sst_itrs[relative_level][idx];
                 if let Some(sst_entry) = itr.next() {
                     let heap_entry = HeapEntry {
                         key: sst_entry.key.to_string(),
@@ -370,6 +444,11 @@ impl KVStore {
         }
 
         println!("Done with merge");
+
+        // Check if compaction for the next level has to be triggered
+        let next_level_new_size: u32 = new_sst_files_metadata.len().try_into().unwrap();
+        let queue_next_level_compaction: bool =
+            start_level + 2 < NUM_LEVELS && next_level_new_size >= get_level_limit(start_level + 1);
 
         {
             let mut higher_level_entries_guard = self.manifest[level_idx].entries.write().await;
@@ -462,7 +541,7 @@ impl KVStore {
                         Ok(_) => println!("Removed old sst file {}", sst_file),
                         Err(err) => panic!("Unable to remove old sst file {}: {}", sst_file, err),
                     };
-                    if level == 0 {
+                    if start_level + level as u32 == 0 {
                         let sst_idx_name = format!(
                             "{}.{}",
                             remove_file_extension(&sst_file),
@@ -471,10 +550,16 @@ impl KVStore {
                         match fs::remove_file(level_path.join(&sst_idx_name)) {
                             Ok(_) => println!(
                                 "Removed old sst index file {} from level {}",
-                                &sst_idx_name, level
+                                &sst_idx_name,
+                                start_level + level as u32,
                             ),
                             Err(err) => {
-                                panic!("Unable to remove old sst index file {}: {}", sst_file, err)
+                                panic!(
+                                    "Unable to remove old sst index file {} from level {}: {}",
+                                    sst_file,
+                                    start_level + level as u32,
+                                    err
+                                )
                             }
                         };
                         let sst_bloom_name = format!(
@@ -485,17 +570,39 @@ impl KVStore {
                         match fs::remove_file(level_path.join(&sst_bloom_name)) {
                             Ok(_) => println!(
                                 "Removed old sst index file {} from level {}",
-                                &sst_bloom_name, level
+                                &sst_bloom_name,
+                                start_level + level as u32,
                             ),
                             Err(err) => {
-                                panic!("Unable to remove old sst index file {}: {}", sst_file, err)
+                                panic!(
+                                    "Unable to remove old sst index file {} from level {}: {}",
+                                    sst_file,
+                                    start_level + level as u32,
+                                    err
+                                )
                             }
                         };
                     }
                 });
             });
+
         File::open(Path::new(DATA_DIR)).unwrap().sync_all().unwrap();
-        println!("Compaction complete")
+        println!("Compaction complete");
+
+        // Trigger next level compaction if needed
+        if queue_next_level_compaction {
+            match self
+                .compaction_tx
+                .try_send(CompactionJob::CompactLevel(start_level + 1))
+            {
+                Ok(_) => {
+                    println!("Queued compaction job at level {}", start_level + 1);
+                }
+                Err(err) => {
+                    println!("Failed to queue compaction job: {}", err);
+                }
+            };
+        }
     }
 
     async fn write_memtable_to_sst(&self, store: &mut BTreeMap<String, Option<String>>) {

@@ -16,12 +16,14 @@ mod tests {
         GET,
         PUT,
         DELETE,
+        SCAN,
         INVALID,
     }
 
     struct Request {
         method: Method,
         key: String,
+        end_key: String,
         value: String,
     }
 
@@ -92,7 +94,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_server() {
-        let test_file_path = Path::new("tests/put-delete.txt");
+        let test_file_path = Path::new("tests/put-delete-scan.txt");
         let path = test_file_path.display();
         let mut stats = HashMap::<Method, Stats>::new();
         stats.insert(
@@ -122,17 +124,39 @@ mod tests {
                 retry_count: 0,
             },
         );
+
+        stats.insert(
+            Method::SCAN,
+            Stats {
+                success_time: 0,
+                retry_time: 0,
+                success_count: 0,
+                retry_count: 0,
+            },
+        );
         let file = match File::open(test_file_path) {
             Err(err) => panic!("Unable to open file {}:{}", path, err),
             Ok(file) => file,
         };
         let put_get_pattern = Regex::new(r"(PUT|GET) (.+) (.+)").unwrap();
         let delete_pattern = Regex::new(r"DELETE (.+)").unwrap();
+        let scan_pattern = Regex::new(r"SCAN (\S+) (\S+) (\S+)").unwrap();
         let client = Client::new();
         let requests: Vec<Request> = BufReader::new(file)
             .lines()
             .map(|line| {
                 let line_str = line.unwrap_or_default();
+                if let Some(captures) = scan_pattern.captures(&line_str) {
+                    let key = captures.get(1).map(|m| m.as_str()).unwrap().to_string();
+                    let end_key = captures.get(2).map(|m| m.as_str()).unwrap().to_string();
+                    let value = captures.get(3).map(|m| m.as_str()).unwrap().to_string();
+                    return Request {
+                        method: Method::SCAN,
+                        key,
+                        end_key,
+                        value,
+                    };
+                }
                 match put_get_pattern.captures(&line_str) {
                     Some(captures) => {
                         let method = captures
@@ -156,13 +180,19 @@ mod tests {
                             })
                             .unwrap()
                             .to_string();
-                        return Request { method, key, value };
+                        return Request {
+                            method,
+                            key,
+                            end_key: "".to_string(),
+                            value,
+                        };
                     }
                     None => match delete_pattern.captures(&line_str) {
                         Some(captures) => {
                             return Request {
                                 method: Method::DELETE,
                                 key: captures.get(1).map(|m| m.as_str()).unwrap().to_string(),
+                                end_key: "".to_string(),
                                 value: "".to_string(),
                             };
                         }
@@ -170,6 +200,7 @@ mod tests {
                             return Request {
                                 method: Method::INVALID,
                                 key: "".to_string(),
+                                end_key: "".to_string(),
                                 value: "".to_string(),
                             };
                         }
@@ -184,7 +215,7 @@ mod tests {
                     let start = Instant::now();
                     let result = retry(|| {
                         client
-                            .get(format!("http://localhost:8000/{}", req.key))
+                            .get(format!("http://localhost:8000/keys/{}", req.key))
                             .send()
                     })
                     .await
@@ -243,6 +274,44 @@ mod tests {
 
                     let resp: reqwest::Response = result.response;
                     assert_eq!(resp.status(), StatusCode::OK);
+                }
+
+                Method::SCAN => {
+                    let start = Instant::now();
+                    let result = retry(|| {
+                        client
+                            // Hits your Axum endpoint, feeding query params to your Range extraction struct
+                            .get(format!(
+                                "http://localhost:8000/scan?start={}&end={}",
+                                req.key, req.end_key
+                            ))
+                            .send()
+                    })
+                    .await
+                    .unwrap();
+                    let success_time = start.elapsed().as_micros() - result.retry_time;
+                    let stat = stats.get_mut(&Method::SCAN).unwrap();
+                    stat.retry_time += result.retry_time;
+                    stat.retry_count += result.retries;
+                    stat.success_time += success_time;
+                    stat.success_count += 1;
+
+                    let response = result.response;
+                    assert_eq!(response.status(), StatusCode::OK);
+
+                    let expected_keys: Vec<String> =
+                        if req.value.is_empty() || req.value == "NOT_FOUND" {
+                            Vec::new()
+                        } else {
+                            req.value.split(',').map(|s| s.trim().to_string()).collect()
+                        };
+
+                    let actual_keys: Vec<String> = response.json().await.unwrap();
+
+                    // expected_keys.sort();
+                    // actual_keys.sort();
+
+                    assert_eq!(actual_keys, expected_keys);
                 }
                 Method::INVALID => println!("Skipping req"),
             };

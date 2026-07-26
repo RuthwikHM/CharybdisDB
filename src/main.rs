@@ -1,6 +1,6 @@
 use axum::{
-    Router, debug_handler,
-    extract::{Path, State},
+    Json, Router, debug_handler,
+    extract::{Path, Query, State},
     http::{StatusCode, Uri},
     routing::{delete, get, put},
 };
@@ -8,7 +8,7 @@ use axum::{
 mod bloom_filter;
 mod storage;
 mod utils;
-use crate::storage::KVStore;
+use crate::{storage::KVStore, utils::Range};
 
 #[debug_handler]
 async fn insert_key(
@@ -43,13 +43,27 @@ async fn delete_key(Path(key): Path<String>, State(kv_store): State<KVStore>) ->
     return StatusCode::OK;
 }
 
+#[debug_handler]
+async fn scan(
+    Query(range): Query<Range>,
+    State(kv_store): State<KVStore>,
+) -> Result<Json<Vec<String>>, StatusCode> {
+    println!("Scan [{:?}, {:?}) called", range.start, range.end);
+    let keys = kv_store.scan(range).await;
+    if keys.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    return Ok(Json(keys));
+}
+
 #[tokio::main]
 async fn main() {
     let kv_store = KVStore::new().await;
     let app = Router::new()
         .route("/:key", put(insert_key))
-        .route("/:key", get(get_key))
+        .route("/keys/:key", get(get_key))
         .route("/:key", delete(delete_key))
+        .route("/scan", get(scan))
         .fallback(|uri: Uri| async move {
             println!("AXUM FALLBACK HIT: {}", uri);
             StatusCode::NOT_FOUND
