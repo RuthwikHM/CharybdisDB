@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek};
+use std::sync::{Arc, atomic::AtomicU32};
 use std::{io, path::Path};
 
 use crate::bloom_filter::BloomFilter;
@@ -119,10 +120,16 @@ pub enum WALOp {
 }
 
 #[derive(Debug)]
+pub struct SSTLevelMetadata {
+    pub next_sst_id: Arc<AtomicU32>,
+    pub entries: Arc<tokio::sync::RwLock<Vec<SSTMetadata>>>,
+}
+
+#[derive(Debug, Clone)]
 pub struct SSTMetadata {
     pub file_name: String,
-    pub index: Option<SparseIndex>,
-    pub bloom_filter: Option<BloomFilter>,
+    pub index: Option<Arc<SparseIndex>>,
+    pub bloom_filter: Option<Arc<BloomFilter>>,
     pub min_key: Option<String>,
     pub max_key: Option<String>,
 }
@@ -143,4 +150,15 @@ pub struct SparseIndexEntry {
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug)]
 pub struct SparseIndex {
     pub entries: Vec<SparseIndexEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Range {
+    pub start: String,
+    pub end: String,
+}
+
+#[derive(Debug)]
+pub enum CompactionJob {
+    CompactLevel(u32),
 }

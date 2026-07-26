@@ -1,8 +1,9 @@
 use crate::bloom_filter::{BLOOM_FILTER_SUFFIX, BLOOM_FP_RATE, BloomFilter};
 use crate::utils::{
-    DATA_DIR, HeapEntry, L0, LEVEL_PREFIX, MANIFEST, MANIFEST_TMP, NUM_LEVELS, SPARSE_INDEX_SUFFIX,
-    SST_FILE_PREFIX, SSTIterator, SSTMetadata, SSTableEntry, SparseIndex, SparseIndexEntry, WAL,
-    WALEntry, WALOp, is_deleted, remove_file_extension,
+    CompactionJob, DATA_DIR, HeapEntry, L0, LEVEL_PREFIX, MANIFEST, MANIFEST_TMP, NUM_LEVELS,
+    Range, SPARSE_INDEX_SUFFIX, SST_FILE_PREFIX, SSTIterator, SSTLevelMetadata, SSTMetadata,
+    SSTableEntry, SparseIndex, SparseIndexEntry, WAL, WALEntry, WALOp, is_deleted,
+    remove_file_extension,
 };
 use rkyv::from_bytes;
 use rkyv::rancor::Error;
@@ -20,7 +21,7 @@ use std::{
     path::Path,
     sync::{Arc, atomic::AtomicU32},
 };
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 
 const MEMTABLE_LIMIT: usize = 2000;
 const WAL_FSYNC_EVERY: u8 = 100;
@@ -28,10 +29,10 @@ const WAL_FSYNC_EVERY: u8 = 100;
 #[derive(Debug, Clone)]
 pub struct KVStore {
     store: Arc<RwLock<BTreeMap<String, Option<String>>>>,
-    next_sst_id: Arc<AtomicU32>,
-    manifest: Arc<RwLock<Vec<Vec<SSTMetadata>>>>,
+    manifest: Arc<Vec<SSTLevelMetadata>>,
     wal_fd: Arc<Mutex<File>>,
     wal_write_counter: Arc<AtomicU8>,
+    compaction_tx: mpsc::Sender<CompactionJob>,
 }
 
 impl KVStore {
@@ -39,12 +40,10 @@ impl KVStore {
         let data_dir = Path::new(DATA_DIR);
         let l0_dir = data_dir.join(L0);
         let l1_dir = data_dir.join(format!("{}{}", LEVEL_PREFIX, 1));
-        let mut created_root_dir = false;
         if !data_dir.exists() {
             match create_dir(data_dir) {
                 Ok(_) => {
                     println!("Created data directory:{}", DATA_DIR);
-                    created_root_dir = true;
                     create_dir(l0_dir).unwrap();
                     create_dir(l1_dir).unwrap();
                 }
@@ -66,21 +65,38 @@ impl KVStore {
             }
         };
 
-        let kvstore = Self {
+        let (compaction_tx, mut compaction_rx) = mpsc::channel::<CompactionJob>(8);
+        let mut kvstore = Self {
             store: Arc::new(RwLock::new(BTreeMap::new())),
-            next_sst_id: Arc::new(AtomicU32::new(0)),
-            manifest: Arc::new(RwLock::new(Vec::<Vec<SSTMetadata>>::new())),
+            manifest: Arc::default(),
             wal_fd: Arc::new(Mutex::new(wal_fd)),
             wal_write_counter: Arc::new(AtomicU8::new(0)),
+            compaction_tx: compaction_tx,
         };
-        if created_root_dir {
-            kvstore
-                .next_sst_id
-                .store(1, std::sync::atomic::Ordering::Relaxed);
-        }
         kvstore.manage_manifest(data_dir).await;
 
         kvstore.replay_wal().await;
+
+        let worker_clone = kvstore.clone();
+        tokio::spawn(async move {
+            println!("Started background worker for compaction");
+            while let Some(job) = compaction_rx.recv().await {
+                match job {
+                    CompactionJob::CompactLevel(level) => {
+                        let level_idx = level as usize;
+                        let mut current_size: u32 = 0;
+                        {
+                            let guard = worker_clone.manifest[level_idx].entries.read().await;
+                            current_size = guard.len().try_into().unwrap();
+                        }
+                        let file_limit = get_level_limit(level);
+                        if current_size >= file_limit {
+                            worker_clone.compact_sst(level).await;
+                        }
+                    }
+                }
+            }
+        });
         return kvstore;
     }
 
@@ -131,11 +147,19 @@ impl KVStore {
             None => {
                 drop(store);
                 let comp_key = key;
-                let sst_files_metadata = self.manifest.read().await;
+                let sst_files_metadata: Vec<SSTMetadata> = {
+                    let guard = self.manifest[0].entries.read().await;
+                    // println!("Get Acquired l0 entries guard");
+                    guard
+                        .iter()
+                        .map(|sst_metadata| sst_metadata.clone())
+                        .collect()
+                };
+                // println!("Get Dropped l0 entries guard");
                 let data_dir_path = Path::new(DATA_DIR);
 
                 // Check L0
-                for sst_file_meta in sst_files_metadata[0].iter().rev() {
+                for sst_file_meta in sst_files_metadata.iter().rev() {
                     let bloom_filter = sst_file_meta.bloom_filter.as_ref().unwrap();
 
                     if !bloom_filter.might_contain(comp_key) {
@@ -166,7 +190,13 @@ impl KVStore {
                 // Check lower levels
                 for i in 1..NUM_LEVELS {
                     let level: usize = i.try_into().unwrap();
-                    let sst_entries = &sst_files_metadata[level];
+                    let sst_entries: Vec<SSTMetadata> = {
+                        let guard = self.manifest[level].entries.read().await;
+                        guard
+                            .iter()
+                            .map(|sst_metadata| sst_metadata.clone())
+                            .collect()
+                    };
                     let valid_sst_entries: Vec<&SSTMetadata> = sst_entries
                         .iter()
                         .filter(|sst_entry| {
@@ -219,31 +249,53 @@ impl KVStore {
         }
     }
 
-    async fn compact_sst(&self, manifest: tokio::sync::RwLockReadGuard<'_, Vec<Vec<SSTMetadata>>>) {
+    pub async fn scan(&self, _range: Range) -> Vec<String> {
+        let result: Vec<String> = Vec::new();
+        return result;
+    }
+
+    // FIXME compaction logic is breaking now possibly due to me messing with the RWGuards.
+    async fn compact_sst(&self, start_level: u32) {
         println!("Compacting SSTs");
         let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
 
-        let old_sst_file_paths: Vec<Vec<String>> = manifest
-            .iter()
-            .map(|entries| {
-                entries
+        let mut old_sst_file_paths: Vec<Vec<String>> = Vec::new();
+        let level_idx: usize = start_level.try_into().unwrap();
+        let lower_level_idx = level_idx + 1;
+
+        {
+            let mut level_guard = self.manifest[level_idx].entries.read().await;
+            old_sst_file_paths.push(
+                level_guard
                     .iter()
-                    .map(|metadata| metadata.file_name.clone())
-                    .collect()
-            })
-            .collect();
+                    .map(|sst_metadata| sst_metadata.file_name.clone())
+                    .collect(),
+            );
+
+            if level_idx + 1 < self.manifest.len() {
+                level_guard = self.manifest[lower_level_idx].entries.read().await;
+                old_sst_file_paths.push(
+                    level_guard
+                        .iter()
+                        .map(|sst_metadata| sst_metadata.file_name.clone())
+                        .collect(),
+                );
+            }
+        }
+
+        println!("Gathered SST file names");
+
         // Collect old sst file names and drop read guard
-        drop(manifest);
         let mut sst_itrs: Vec<Vec<SSTIterator>> = old_sst_file_paths
             .iter()
             .enumerate()
-            .map(|(level, entries)| {
+            .map(|(idx, entries)| {
                 entries
                     .iter()
                     .map(|sst_file| {
                         return SSTIterator::open(
                             Path::new(DATA_DIR)
-                                .join(format!("{}{}", LEVEL_PREFIX, level))
+                                .join(format!("{}{}", LEVEL_PREFIX, start_level + idx as u32))
                                 .join(&sst_file)
                                 .as_path(),
                         );
@@ -259,12 +311,13 @@ impl KVStore {
                         key: sst_entry.key,
                         value: sst_entry.value,
                         sst_table_pos: i as u64,
-                        level: level as u32,
+                        level: start_level + level as u32,
                     };
                     heap.push(heap_entry);
                 }
             }
         }
+        println!("File iterators pushed to heap");
 
         let mut new_sst_table: Vec<SSTableEntry> = Vec::with_capacity(MEMTABLE_LIMIT);
         let mut new_sst_files_metadata: Vec<SSTMetadata> = Vec::new();
@@ -290,7 +343,7 @@ impl KVStore {
 
                 if new_sst_table.len() == MEMTABLE_LIMIT {
                     // Write all entries to an SST file
-                    new_sst_files_metadata.push(self.write_sst(&new_sst_table, 1));
+                    new_sst_files_metadata.push(self.write_sst(&new_sst_table, start_level + 1));
                     new_sst_table.clear();
                 }
             }
@@ -312,33 +365,99 @@ impl KVStore {
         }
 
         if new_sst_table.len() != 0 {
-            new_sst_files_metadata.push(self.write_sst(&new_sst_table, 1));
+            new_sst_files_metadata.push(self.write_sst(&new_sst_table, start_level + 1));
             new_sst_table.clear();
         }
 
-        let mut manifest_entries = self.manifest.write().await;
-        // Clear previous level, assign new SSTs to next level
-        manifest_entries[0].clear();
-        manifest_entries[1] = new_sst_files_metadata;
+        println!("Done with merge");
 
-        self.update_manifest_atomic(
-            manifest_entries
-                .iter()
-                .map(|level_entries| {
-                    level_entries
+        {
+            let mut higher_level_entries_guard = self.manifest[level_idx].entries.write().await;
+            // println!("Compact acquired level {} guard", level_idx);
+            let mut lower_level_entries_guard =
+                self.manifest[lower_level_idx].entries.write().await;
+            // println!("Compact acquired level {} guard", level_idx + 1);
+            // Clear previous level, assign new SSTs to next level
+            higher_level_entries_guard.clear();
+            self.manifest[level_idx]
+                .next_sst_id
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+            *lower_level_entries_guard = new_sst_files_metadata;
+
+            let mut level_file_names: Vec<Vec<String>> = Vec::new();
+            for i in 0..NUM_LEVELS {
+                let level: usize = i.try_into().unwrap();
+                if level == level_idx {
+                    level_file_names.push(
+                        higher_level_entries_guard
+                            .iter()
+                            .map(|sst_metadata| match level == 0 {
+                                true => sst_metadata.file_name.clone(),
+                                false => {
+                                    format!(
+                                        "{}-{}:{}",
+                                        sst_metadata.min_key.as_ref().unwrap(),
+                                        sst_metadata.max_key.as_ref().unwrap(),
+                                        &sst_metadata.file_name
+                                    )
+                                }
+                            })
+                            .collect(),
+                    );
+                } else if level == lower_level_idx {
+                    level_file_names.push(
+                        lower_level_entries_guard
+                            .iter()
+                            .map(|sst_metadata| match level == 0 {
+                                true => sst_metadata.file_name.clone(),
+                                false => {
+                                    format!(
+                                        "{}-{}:{}",
+                                        sst_metadata.min_key.as_ref().unwrap(),
+                                        sst_metadata.max_key.as_ref().unwrap(),
+                                        &sst_metadata.file_name
+                                    )
+                                }
+                            })
+                            .collect(),
+                    );
+                } else {
+                    let level_entries_guard = self.manifest[level].entries.read().await;
+                    let level_entry_filenames: Vec<String> = level_entries_guard
                         .iter()
-                        .map(|metadata| &metadata.file_name)
-                        .collect()
-                })
-                .collect(),
-        );
+                        .map(|sst_metadata| match level == 0 {
+                            true => sst_metadata.file_name.clone(),
+                            false => {
+                                format!(
+                                    "{}-{}:{}",
+                                    sst_metadata.min_key.as_ref().unwrap(),
+                                    sst_metadata.max_key.as_ref().unwrap(),
+                                    &sst_metadata.file_name
+                                )
+                            }
+                        })
+                        .collect();
+                    level_file_names.push(level_entry_filenames);
+                    drop(level_entries_guard);
+                }
+            }
+
+            println!("Updating manifest on disk");
+            self.update_manifest_atomic(level_file_names);
+            // println!("Compact dropped level {} guard", level_idx);
+            // println!("Compact dropped level {} guard", level_idx + 1);
+        }
 
         old_sst_file_paths
             .iter()
             .enumerate()
             .for_each(|(level, entries)| {
                 entries.iter().for_each(|sst_file| {
-                    let level_path = Path::new(DATA_DIR).join(format!("{}{}", LEVEL_PREFIX, level));
+                    let level_path = Path::new(DATA_DIR).join(format!(
+                        "{}{}",
+                        LEVEL_PREFIX,
+                        start_level + level as u32
+                    ));
                     match fs::remove_file(level_path.join(&sst_file)) {
                         Ok(_) => println!("Removed old sst file {}", sst_file),
                         Err(err) => panic!("Unable to remove old sst file {}: {}", sst_file, err),
@@ -350,7 +469,10 @@ impl KVStore {
                             SPARSE_INDEX_SUFFIX
                         );
                         match fs::remove_file(level_path.join(&sst_idx_name)) {
-                            Ok(_) => println!("Removed old sst index file {}", &sst_idx_name),
+                            Ok(_) => println!(
+                                "Removed old sst index file {} from level {}",
+                                &sst_idx_name, level
+                            ),
                             Err(err) => {
                                 panic!("Unable to remove old sst index file {}: {}", sst_file, err)
                             }
@@ -361,7 +483,10 @@ impl KVStore {
                             BLOOM_FILTER_SUFFIX
                         );
                         match fs::remove_file(level_path.join(&sst_bloom_name)) {
-                            Ok(_) => println!("Removed old sst index file {}", &sst_bloom_name),
+                            Ok(_) => println!(
+                                "Removed old sst index file {} from level {}",
+                                &sst_bloom_name, level
+                            ),
                             Err(err) => {
                                 panic!("Unable to remove old sst index file {}: {}", sst_file, err)
                             }
@@ -395,25 +520,33 @@ impl KVStore {
 
         let sst_files_metadata = vec![self.write_sst(&ss_table, 0)];
 
-        let mut manifest_entries = self.manifest.write().await;
-        manifest_entries[0].extend(sst_files_metadata);
+        // Update SST L0 entries with the new table
+        {
+            let mut manifest_entries = self.manifest[0].entries.write().await;
+            // println!("Write mem table acquired level 0 manifest lock");
+            manifest_entries.extend(sst_files_metadata);
+        }
+        // println!("Write mem table dropped level 0 manifest lock");
 
-        self.update_manifest_atomic(
-            manifest_entries
-                .iter()
-                .map(|level_entries| {
-                    level_entries
-                        .iter()
-                        .map(|metadata| &metadata.file_name)
-                        .collect()
-                })
-                .collect(),
-        );
-        drop(manifest_entries);
-        let manifest_read_guard = self.manifest.read().await;
+        let manifest_entries = self.get_manifest_entry_names().await;
+        self.update_manifest_atomic(manifest_entries);
+        // drop(manifest_entries);
+        let mut l0_size: u32 = {
+            // println!("Write mem table compact acquired level 0 manifest lock");
+            let manifest_read_guard = self.manifest[0].entries.read().await;
+            manifest_read_guard.len() as u32
+        };
+        // println!("Write mem table compact dropped level 0 manifest lock");
         // Trigger compaction if needed
-        if manifest_read_guard[0].len() == 5 {
-            self.compact_sst(manifest_read_guard).await;
+        if l0_size == 5 {
+            match self.compaction_tx.try_send(CompactionJob::CompactLevel(0)) {
+                Ok(_) => {
+                    println!("Queued compaction job at level 0");
+                }
+                Err(err) => {
+                    println!("Failed to queue compaction job: {}", err);
+                }
+            };
         }
 
         //Clear MemTable
@@ -423,8 +556,34 @@ impl KVStore {
         self.truncate_wal();
     }
 
+    async fn get_manifest_entry_names(&self) -> Vec<Vec<String>> {
+        let mut manifest_data: Vec<Vec<String>> = Vec::new();
+        for i in 0..NUM_LEVELS {
+            let level: usize = i.try_into().unwrap();
+            let level_entries_guard = self.manifest[level].entries.read().await;
+            let level_entry_filenames: Vec<String> = level_entries_guard
+                .iter()
+                .map(|sst_metadata| match level == 0 {
+                    true => sst_metadata.file_name.clone(),
+                    false => {
+                        format!(
+                            "{}-{}:{}",
+                            sst_metadata.min_key.as_ref().unwrap(),
+                            sst_metadata.max_key.as_ref().unwrap(),
+                            &sst_metadata.file_name
+                        )
+                    }
+                })
+                .collect();
+            manifest_data.push(level_entry_filenames);
+            drop(level_entries_guard);
+        }
+        return manifest_data;
+    }
+
     fn write_sst(&self, ss_table: &Vec<SSTableEntry>, level: u32) -> SSTMetadata {
-        let current_sst_id = self
+        let idx: usize = level.try_into().unwrap();
+        let current_sst_id: u32 = self.manifest[idx]
             .next_sst_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sst_file_name = format!("{}-{}.json", SST_FILE_PREFIX, current_sst_id);
@@ -494,8 +653,8 @@ impl KVStore {
 
                 SSTMetadata {
                     file_name: sst_file_name,
-                    index: Some(index),
-                    bloom_filter: Some(bloom_filter),
+                    index: Some(Arc::new(index)),
+                    bloom_filter: Some(Arc::new(bloom_filter)),
                     min_key: None,
                     max_key: None,
                 }
@@ -547,7 +706,7 @@ impl KVStore {
         };
     }
 
-    fn update_manifest_atomic(&self, manifest_entries: Vec<Vec<&String>>) {
+    fn update_manifest_atomic(&self, manifest_entries: Vec<Vec<String>>) {
         let manifest_file_path = Path::new(DATA_DIR).join(MANIFEST);
         let manifest_tmp_file_path = Path::new(DATA_DIR).join(MANIFEST_TMP);
         let manifest_tmp_fd = File::create(&manifest_tmp_file_path).unwrap();
@@ -556,8 +715,10 @@ impl KVStore {
         for level in 0..NUM_LEVELS {
             writer.write(format!("[L{}]\n", level).as_bytes()).unwrap();
             let idx: usize = level.try_into().unwrap();
-            manifest_entries[idx].iter().for_each(|sst_file| {
-                let _ = writer.write(format!("{}\n", &sst_file).as_bytes()).unwrap();
+            manifest_entries[idx].iter().for_each(|sst_entry_filename| {
+                writer
+                    .write(format!("{}\n", &sst_entry_filename).as_bytes())
+                    .unwrap();
             });
             writer.flush().unwrap();
         }
@@ -609,19 +770,22 @@ impl KVStore {
         wal_fd.sync_all().unwrap();
     }
 
-    // FIXME use different sst ids per level instead of a global one like it is right now
-    async fn manage_manifest(&self, data_dir: &Path) {
+    async fn manage_manifest(&mut self, data_dir: &Path) {
         let manifest_file = data_dir.join(MANIFEST);
         // Initialize in memory MANIFEST empty representation
-        let mut manifest_entries = self.manifest.write().await;
+        let mut manifest_entries: Vec<SSTLevelMetadata> = Vec::new();
         for level in 0..NUM_LEVELS {
-            manifest_entries.push(Vec::new());
-            fs::create_dir(data_dir.join(format!("{}{}", LEVEL_PREFIX, level))).unwrap();
+            manifest_entries.push(SSTLevelMetadata {
+                next_sst_id: Arc::new(AtomicU32::new(1)),
+                entries: Arc::new(RwLock::new(Vec::new())),
+            });
+            let level_dir_path = data_dir.join(format!("{}{}", LEVEL_PREFIX, level));
+            if !fs::exists(&level_dir_path).unwrap() {
+                fs::create_dir(level_dir_path).unwrap();
+            }
         }
         match manifest_file.exists() {
             false => {
-                self.next_sst_id
-                    .store(1, std::sync::atomic::Ordering::Relaxed);
                 let manifest_file_path = manifest_file.clone();
                 match File::create(manifest_file) {
                     Ok(_) => {
@@ -637,8 +801,15 @@ impl KVStore {
                 }
             }
             true => {
+                // Acquire write guards for each level so we can append Manifest representation
+                let mut level_entries_guards: Vec<tokio::sync::RwLockWriteGuard<Vec<SSTMetadata>>> =
+                    Vec::new();
+
                 let mut sst_files: HashSet<String> = Default::default();
                 for level in 0..NUM_LEVELS {
+                    let idx: usize = level.try_into().unwrap();
+                    level_entries_guards.push(manifest_entries[idx].entries.write().await);
+
                     sst_files.extend(
                         fs::read_dir(data_dir.join(format!("{}{}", LEVEL_PREFIX, level)))
                             .unwrap()
@@ -653,69 +824,79 @@ impl KVStore {
                 fs::read_to_string(manifest_file)
                     .unwrap()
                     .lines()
-                    .for_each(|entry| {
-                        if entry.starts_with("[L") {
-                            let p1 = entry.find("L").unwrap() + 1;
-                            let p2 = entry.find("]").unwrap();
-                            level = usize::from_str(entry.get(p1..p2).unwrap()).unwrap();
+                    .for_each(|line| {
+                        if line.starts_with("[L") {
+                            let p1 = line.find("L").unwrap() + 1;
+                            let p2 = line.find("]").unwrap();
+                            level = usize::from_str(line.get(p1..p2).unwrap()).unwrap();
                         } else {
-                            if level == 0 {
-                                let sst_file = remove_file_extension(entry);
-                                let index_file_name =
-                                    format!("{}.{}", sst_file, SPARSE_INDEX_SUFFIX);
-                                let mut index_fd =
-                                    File::open(Path::new(DATA_DIR).join(index_file_name)).unwrap();
-                                let mut index_content_bytes: AlignedVec<16> = AlignedVec::new();
-                                index_content_bytes
-                                    .extend_from_reader(&mut index_fd)
+                            match level == 0 {
+                                true => {
+                                    let sst_file = remove_file_extension(line);
+                                    let index_file_name =
+                                        format!("{}.{}", sst_file, SPARSE_INDEX_SUFFIX);
+                                    let mut index_fd = File::open(
+                                        Path::new(DATA_DIR).join(L0).join(index_file_name),
+                                    )
                                     .unwrap();
-                                let index =
-                                    from_bytes::<SparseIndex, Error>(&index_content_bytes).unwrap();
-
-                                let bloom_filter_file_name =
-                                    format!("{}.{}", sst_file, BLOOM_FILTER_SUFFIX);
-                                let mut bloom_fd =
-                                    File::open(Path::new(DATA_DIR).join(bloom_filter_file_name))
+                                    let mut index_content_bytes: AlignedVec<16> = AlignedVec::new();
+                                    index_content_bytes
+                                        .extend_from_reader(&mut index_fd)
                                         .unwrap();
-                                let mut bloom_content_bytes: AlignedVec<16> = AlignedVec::new();
-                                bloom_content_bytes
-                                    .extend_from_reader(&mut bloom_fd)
+                                    let index =
+                                        from_bytes::<SparseIndex, Error>(&index_content_bytes)
+                                            .unwrap();
+
+                                    let bloom_filter_file_name =
+                                        format!("{}.{}", sst_file, BLOOM_FILTER_SUFFIX);
+                                    let mut bloom_fd = File::open(
+                                        Path::new(DATA_DIR).join(L0).join(bloom_filter_file_name),
+                                    )
                                     .unwrap();
-                                let bloom_filter =
-                                    from_bytes::<BloomFilter, Error>(&bloom_content_bytes).unwrap();
+                                    let mut bloom_content_bytes: AlignedVec<16> = AlignedVec::new();
+                                    bloom_content_bytes
+                                        .extend_from_reader(&mut bloom_fd)
+                                        .unwrap();
+                                    let bloom_filter =
+                                        from_bytes::<BloomFilter, Error>(&bloom_content_bytes)
+                                            .unwrap();
 
-                                manifest_entries[level].push(SSTMetadata {
-                                    file_name: entry.to_string(),
-                                    index: Some(index),
-                                    bloom_filter: Some(bloom_filter),
-                                    min_key: None,
-                                    max_key: None,
-                                });
-                            } else {
-                                let semicolon_idx = entry.find(":").unwrap();
-                                let hypen_idx = entry.find("-").unwrap();
-                                let min_key = String::from(entry.get(0..hypen_idx).unwrap());
-                                let max_key =
-                                    String::from(entry.get(hypen_idx + 1..semicolon_idx).unwrap());
-                                let sst_file_name = entry.get(semicolon_idx + 1..).unwrap();
+                                    level_entries_guards[level].push(SSTMetadata {
+                                        file_name: line.to_string(),
+                                        index: Some(Arc::new(index)),
+                                        bloom_filter: Some(Arc::new(bloom_filter)),
+                                        min_key: None,
+                                        max_key: None,
+                                    });
+                                }
+                                false => {
+                                    // Entries like a-b: sst-1.json
+                                    let semicolon_idx = line.find(":").unwrap();
+                                    let hypen_idx = line.find("-").unwrap();
+                                    let min_key = String::from(line.get(0..hypen_idx).unwrap());
+                                    let max_key = String::from(
+                                        line.get(hypen_idx + 1..semicolon_idx).unwrap(),
+                                    );
+                                    let sst_file_name = line.get(semicolon_idx + 1..).unwrap();
 
-                                manifest_entries[level].push(SSTMetadata {
-                                    file_name: sst_file_name.to_string(),
-                                    index: None,
-                                    bloom_filter: None,
-                                    min_key: Some(min_key),
-                                    max_key: Some(max_key),
-                                });
+                                    level_entries_guards[level].push(SSTMetadata {
+                                        file_name: sst_file_name.to_string(),
+                                        index: None,
+                                        bloom_filter: None,
+                                        min_key: Some(min_key),
+                                        max_key: Some(max_key),
+                                    });
+                                }
                             }
                         }
                     });
 
                 // Mark valid SSTs to prevent deletion
-                manifest_entries
+                level_entries_guards
                     .iter()
                     .enumerate()
-                    .for_each(|(level, entries)| {
-                        entries.iter().for_each(|sst_file_meta| {
+                    .for_each(|(level, sst_level_meta)| {
+                        sst_level_meta.iter().for_each(|sst_file_meta| {
                             sst_files.remove(
                                 &data_dir
                                     .join(format!("{}{}", LEVEL_PREFIX, level))
@@ -734,29 +915,45 @@ impl KVStore {
                         }
                     };
                 });
-                // Find next available SST ID for Level 0
-                let next_sst_id: u32 = match manifest_entries[0].last() {
-                    Some(last_file_meta) => {
-                        let last_line = &last_file_meta.file_name;
-                        let start = last_line.rfind("-").unwrap();
-                        let end = last_line.rfind(".").unwrap();
-                        match last_line.get(start + 1..end) {
-                            Some(value) => value.parse::<u32>().unwrap() + 1,
-                            None => 1,
+                // Find next available SST ID for each level
+                for i in 0..NUM_LEVELS {
+                    let level: usize = i.try_into().unwrap();
+                    let next_sst_id: u32 = match level_entries_guards[level].last() {
+                        Some(last_file_meta) => {
+                            let last_line = &last_file_meta.file_name;
+                            let start = last_line.rfind("-").unwrap();
+                            let end = last_line.rfind(".").unwrap();
+                            match last_line.get(start + 1..end) {
+                                Some(value) => value.parse::<u32>().unwrap() + 1,
+                                None => 1,
+                            }
                         }
-                    }
-                    None => 1,
-                };
+                        None => 1,
+                    };
+                    manifest_entries[level]
+                        .next_sst_id
+                        .store(next_sst_id, std::sync::atomic::Ordering::Relaxed);
+                }
                 // println!(
                 //     "Dir:{:?}\nManifest:{:?}\n Last:{}",
                 //     sst_files, manifest_entries, last_line
                 // );
-
-                self.next_sst_id
-                    .store(next_sst_id, std::sync::atomic::Ordering::Relaxed);
+                // Dropping guards on the SST entries Vec at each level
+                drop(level_entries_guards);
             }
         }
+
+        self.manifest = Arc::new(manifest_entries);
     }
+}
+
+fn get_level_limit(level: u32) -> u32 {
+    match level {
+        0 => 5,
+        _ => 5 + (5 * level),
+    }
+    // 1 => 10,
+    // _ => 10 * (10_usize.pow(level - 1)), // General growth factor (10x per level)
 }
 
 fn find_sparse_idx_offset(comp_key: &str, sst_file_meta: &SSTMetadata) -> u64 {
